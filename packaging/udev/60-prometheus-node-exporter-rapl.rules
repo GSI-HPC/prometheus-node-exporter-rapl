@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+# Grant group "rapl" read access to the RAPL energy counters.
+#
+# Since Linux 5.10 (CVE-2020-8694, "PLATYPUS") every powercap zone's
+# energy_uj attribute is mode 0400 root, because reading it at a high rate
+# is a power side channel. The other files node_exporter's rapl collector
+# reads per zone (name, max_energy_range_uj) are 0444 already.
+#
+# Every zone and sub-zone (intel-rapl:0, intel-rapl:0:0, intel-rapl:1, ...,
+# and intel-rapl-mmio:* where present) is its own powercap device, so one
+# rule covers all of them; the parent control-type device (intel-rapl) has
+# no energy_uj and is skipped by the ATTR match. AMD Zen exposes the same
+# intel-rapl:* names through intel_rapl_common.
+#
+# sysfs attributes are not device nodes, so udev's GROUP= and MODE= keys do
+# not apply to them, and a RUN+= chgrp/chmod would execute in the udev_t
+# SELinux domain, which under the stock targeted policy may read and write
+# sysfs files but not change their attributes. Instead each matching zone
+# is handed to systemd: the template name in SYSTEMD_WANTS is instantiated
+# with the zone's escaped sysfs path, and that instance applies the group
+# and mode as root. systemd re-runs an inactive wanted unit on every add
+# event, so a reload of the intel_rapl_* modules and the udevadm trigger in
+# the package scriptlet re-apply the permissions as well.
+ACTION!="remove", SUBSYSTEM=="powercap", ATTR{energy_uj}=="?*", \
+  TAG+="systemd", ENV{SYSTEMD_WANTS}+="prometheus-node-exporter-rapl@.service"
