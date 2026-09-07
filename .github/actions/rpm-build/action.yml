@@ -1,0 +1,113 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Build RPM
+description: >
+  Build the SRPM and noarch RPM from the checked-out tree inside an
+  EL/Fedora container, rebuild the SRPM the way a build system would,
+  apply the rpmlint policy check, then install the package with dnf,
+  verify what it put on disk with the container's own systemd, and remove
+  it again. Shared by ci.yml and release.yml so the recipe exists once.
+
+runs:
+  using: composite
+  steps:
+    - name: Install build dependencies
+      shell: bash
+      run: |
+        set -euxo pipefail
+        . /etc/os-release
+        if [ "${ID}" != "fedora" ]; then
+          dnf -y install epel-release
+        fi
+        # glibc-langpack-en: rpmlint 2.x parses the spec under
+        # LC_ALL=en_US.UTF-8, and a container without that locale makes
+        # bash print setlocale warnings that rpmlint reports as
+        # specfile-warning findings.
+        dnf -y install rpm-build rpmlint systemd-rpm-macros git-core glibc-langpack-en
+
+    - name: Build source tarball and SRPM
+      shell: bash
+      run: |
+        set -euxo pipefail
+        git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        spec=packaging/rpm/prometheus-node-exporter-rapl.spec
+        version="$(sed -n 's/^Version:[[:space:]]*//p' "$spec" | head -1)"
+        # The tarball must carry the name and prefix the expanded Source0
+        # expects (a GitHub archive of tag v${version}).
+        srcurl="$(rpmspec -P "$spec" | sed -n 's/^Source0:[[:space:]]*//p')"
+        base="${srcurl##*/}"
+        case "$srcurl" in *'#/'*) base="${srcurl##*#/}" ;; esac
+        mkdir -p "$HOME/rpmbuild/SOURCES"
+        git archive --format=tar.gz --prefix="prometheus-node-exporter-rapl-${version}/" \
+          -o "$HOME/rpmbuild/SOURCES/${base}" HEAD
+        # Source1: the sysusers file %pre reads at spec parse time.
+        cp packaging/systemd/prometheus-node-exporter-rapl.sysusers "$HOME/rpmbuild/SOURCES/"
+        rpmbuild -bs "$spec"
+
+    - name: Rebuild binary RPM from the SRPM
+      shell: bash
+      run: |
+        set -euxo pipefail
+        # From a directory that is not the checkout, so that the SRPM has
+        # to be self-contained the way it is for everyone else.
+        cd "$(mktemp -d)"
+        rpmbuild --rebuild "$HOME"/rpmbuild/SRPMS/prometheus-node-exporter-rapl-*.src.rpm
+
+    - name: rpmlint policy check
+      shell: bash
+      run: |
+        set -euxo pipefail
+        ./scripts/run-rpmlint.sh packaging/rpm/prometheus-node-exporter-rapl.spec \
+          "$HOME"/rpmbuild/SRPMS/prometheus-node-exporter-rapl-*.src.rpm \
+          "$HOME"/rpmbuild/RPMS/noarch/prometheus-node-exporter-rapl-*.rpm
+
+    - name: Stage artifacts
+      shell: bash
+      run: |
+        set -euxo pipefail
+        mkdir -p rpm-artifacts
+        cp "$HOME"/rpmbuild/SRPMS/prometheus-node-exporter-rapl-*.src.rpm \
+           "$HOME"/rpmbuild/RPMS/noarch/prometheus-node-exporter-rapl-*.rpm \
+           rpm-artifacts/
+
+    - name: Install, verify and remove the package
+      shell: bash
+      run: |
+        set -euxo pipefail
+        # The container has no running systemd or udev, so the scriptlets
+        # take their "nothing to apply to" branches; what is checked here
+        # is the file layout, the group creation (%pre on EL, rpm's own
+        # sysusers support on Fedora) and that this release's systemd
+        # accepts every directive in the shipped units.
+        dnf -y install rpm-artifacts/prometheus-node-exporter-rapl-*.noarch.rpm
+        rpm -V prometheus-node-exporter-rapl
+        getent group rapl
+        for f in /usr/lib/sysusers.d/prometheus-node-exporter-rapl.conf \
+                 /usr/lib/udev/rules.d/60-prometheus-node-exporter-rapl.rules \
+                 /usr/lib/systemd/system/prometheus-node-exporter-rapl@.service \
+                 /usr/lib/systemd/system/prometheus-node-exporter.service.d/rapl.conf; do
+          test -f "$f"
+        done
+        # verify exits 0 on an unknown directive (it only warns), so the
+        # output is checked for that as well.
+        out="$(systemd-analyze verify --man=no \
+                 /usr/lib/systemd/system/prometheus-node-exporter-rapl@.service 2>&1)"
+        printf '%s\n' "$out"
+        if grep -q 'Unknown key' <<<"$out"; then exit 1; fi
+        # The drop-in against a stand-in for the exporter unit, which is
+        # not installed here. At debug level verify dumps the loaded unit,
+        # which shows whether the drop-in was picked up and parsed.
+        cat > /etc/systemd/system/prometheus-node-exporter.service <<'EOF'
+        [Unit]
+        Description=stand-in for the EPEL node_exporter unit
+        [Service]
+        ExecStart=/usr/bin/true
+        EOF
+        out="$(cd /etc/systemd/system && SYSTEMD_LOG_LEVEL=debug \
+                 systemd-analyze verify --man=no prometheus-node-exporter.service 2>&1)"
+        if grep -q 'Unknown key' <<<"$out"; then exit 1; fi
+        grep -q 'DropIn Path: /usr/lib/systemd/system/prometheus-node-exporter.service.d/rapl.conf' <<<"$out"
+        grep -q '^[[:space:]]*SupplementaryGroups: rapl$' <<<"$out"
+        rm -f /etc/systemd/system/prometheus-node-exporter.service
+        dnf -y --noautoremove remove prometheus-node-exporter-rapl
+        test ! -e /usr/lib/udev/rules.d/60-prometheus-node-exporter-rapl.rules
+        test ! -e /usr/lib/systemd/system/prometheus-node-exporter.service.d

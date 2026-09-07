@@ -1,0 +1,125 @@
+# SPDX-License-Identifier: Apache-2.0
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Third-party actions are pinned to full commit SHAs (supply-chain
+# requirement); every job carries the minimum permissions it needs.
+permissions: {}
+
+jobs:
+  lint:
+    # Static checks of the shipped files with the tools that ship with the
+    # runner's systemd (255 on ubuntu-24.04): udevadm verify does not
+    # exist on EL9 yet, so this is where the rule's syntax is checked.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: shellcheck
+        run: shellcheck scripts/*.sh .githooks/commit-msg
+      - name: udev rule syntax
+        run: udevadm verify --resolve-names=never packaging/udev/*.rules
+      - name: sysusers file
+        run: systemd-sysusers --dry-run "$PWD"/packaging/systemd/prometheus-node-exporter-rapl.sysusers
+      - name: Template unit, one instance and the drop-in
+        run: |
+          set -euo pipefail
+          cd packaging/systemd
+          # verify only warns about unknown directives, so its output is
+          # checked too. The instance name is an escaped sysfs path of the
+          # shape the udev rule produces (":" cannot be tested through
+          # systemd-analyze, which reads it as a path:alias separator).
+          out="$(systemd-analyze verify --man=no \
+            'prometheus-node-exporter-rapl@.service' \
+            'prometheus-node-exporter-rapl@sys-devices-virtual-powercap-intel\x2drapl-intel\x2drapl\x3a0.service' 2>&1)"
+          printf '%s\n' "$out"
+          if grep -q 'Unknown key' <<<"$out"; then exit 1; fi
+          # The drop-in against a stand-in for the exporter unit. At debug
+          # level verify dumps the loaded unit, which shows whether the
+          # drop-in was picked up and parsed.
+          tmp="$(mktemp -d)"
+          cat > "$tmp/prometheus-node-exporter.service" <<'EOF'
+          [Unit]
+          Description=stand-in for the EPEL node_exporter unit
+          [Service]
+          ExecStart=/usr/bin/true
+          EOF
+          cp -r prometheus-node-exporter.service.d "$tmp/"
+          out="$(cd "$tmp" && SYSTEMD_LOG_LEVEL=debug \
+            systemd-analyze verify --man=no prometheus-node-exporter.service 2>&1)"
+          if grep -q 'Unknown key' <<<"$out"; then exit 1; fi
+          grep -q 'DropIn Path: .*/prometheus-node-exporter.service.d/rapl.conf' <<<"$out"
+          grep -q '^[[:space:]]*SupplementaryGroups: rapl$' <<<"$out"
+      - name: Unit hardening score
+        run: |
+          # --threshold= takes the 0-100 scale behind the printed exposure
+          # level (1.5 is 15); 30 is the upper end of systemd's "OK" band,
+          # so dropping a hardening directive fails the job.
+          cd packaging/systemd
+          systemd-analyze security --offline=yes --no-pager --threshold=30 \
+            prometheus-node-exporter-rapl@.service
+
+  rpm:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # EL9 is the supported target; EL10 and Fedora run advisory-only
+          # to catch packaging-macro drift early.
+          - image: rockylinux/rockylinux:9
+            artifact: el9
+            experimental: false
+          - image: rockylinux/rockylinux:10
+            artifact: el10
+            experimental: true
+          - image: fedora:latest
+            artifact: fedora
+            experimental: true
+    continue-on-error: ${{ matrix.experimental }}
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      # The images ship without git. Without it actions/checkout silently
+      # falls back to downloading a repository tarball, which leaves no .git
+      # directory and makes the action's `git archive HEAD` fail.
+      - name: Install git for checkout
+        run: dnf -y install git-core
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/rpm-build
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rpms-${{ matrix.artifact }}
+          path: rpm-artifacts/
+
+  commit-lint:
+    # Dependabot's generated messages carry release-note links longer than
+    # the body line limit and action names longer than the header limit;
+    # they are machine-shaped and reviewed as such, so skip them.
+    if: github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      # fetch-depth: 0 is required so the full PR commit range exists
+      # locally; without it the range is unavailable and nothing would be
+      # checked.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: commitlint (structure)
+        uses: wagoid/commitlint-github-action@b948419dd99f3fd78a6548d48f94e3df7f6bf3ed # v6.2.1
+        with:
+          configFile: .commitlintrc.yml
+      - name: self-contained-facts guard
+        run: |
+          ./scripts/check-commit-context.sh \
+            "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
