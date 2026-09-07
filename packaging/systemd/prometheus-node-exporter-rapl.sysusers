@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# The group that holds read access to the RAPL energy counters. It is
+# deliberately not the exporter's own group: the packaged drop-in adds it
+# to prometheus-node-exporter.service as a supplementary group, which works
+# whatever User= that unit sets, DynamicUser=yes included.
+# Type Name ID GECOS Home Shell
+g rapl - -
