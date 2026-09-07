@@ -1,0 +1,4 @@
+# build artifacts
+*.rpm
+*.tar.gz
+rpm-artifacts/
