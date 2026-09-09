@@ -24,7 +24,12 @@ set -euo pipefail
 #   and udev, whose vendor directories live under /usr/lib by design
 #   (/usr/lib/systemd, /usr/lib/udev, /usr/lib/sysusers.d); rpmlint 1.11
 #   on EL9 only exempts a fixed list of other /usr/lib subtrees.
-allow='spelling-error|invalid-license|no-buildroot-tag|invalid-url Source0|only-non-binary-in-usr-lib'
+# - no-%check-section: rpmlint 2.x (EL10, Fedora) asks every spec for a
+#   %check section. The package carries no code, so there is nothing to
+#   test at build time; the units, the udev rule and the sysusers file are
+#   verified in CI's lint job, against a systemd new enough to have
+#   `udevadm verify` (EL9's is not).
+allow='spelling-error|invalid-license|no-buildroot-tag|invalid-url Source0|only-non-binary-in-usr-lib|no-%check-section'
 
 # One rpmlint run per file. rpmlint's spec checker keeps its section state
 # across the files of a single run, so checking the spec file and then the
