@@ -108,6 +108,12 @@ runs:
         grep -q 'DropIn Path: /usr/lib/systemd/system/prometheus-node-exporter.service.d/rapl.conf' <<<"$out"
         grep -q '^[[:space:]]*SupplementaryGroups: rapl$' <<<"$out"
         rm -f /etc/systemd/system/prometheus-node-exporter.service
-        dnf -y --noautoremove remove prometheus-node-exporter-rapl
+        # rpm -e rather than dnf: the option that stops dnf from taking
+        # the package's dependencies (systemd, systemd-udev) out with it
+        # is spelled --noautoremove on dnf4 and --no-autoremove on
+        # current dnf5, and dnf5 rejects either before the subcommand.
+        # Removing exactly this package runs the same %postun, which is
+        # what the assertions below check.
+        rpm -e prometheus-node-exporter-rapl
         test ! -e /usr/lib/udev/rules.d/60-prometheus-node-exporter-rapl.rules
         test ! -e /usr/lib/systemd/system/prometheus-node-exporter.service.d
